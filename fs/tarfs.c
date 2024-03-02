@@ -98,10 +98,10 @@ static int tarfs_readdir(struct file *file, struct dir_context *ctx)
 	int ret = 0;
 	char *name_buffer = NULL;
 	u64 name_len = 0;
+	u64 cur = ctx->pos;
 	u64 size = i_size_read(inode) / sizeof(disk_dentry) * sizeof(disk_dentry);
-	loff_t orig_pos = ctx->pos;
 
-	/* ctx->pos must be aligned to a directory entry. */
+	/* cur must be aligned to a directory entry. */
 	if (ctx->pos % sizeof(struct tarfs_direntry))
 		return -ENOENT;
 
@@ -109,33 +109,28 @@ static int tarfs_readdir(struct file *file, struct dir_context *ctx)
 	if (offset + size < offset)
 		return -ERANGE;
 
-	/* Make sure the increment of ctx->pos won't overflow by limiting size. */
+	/* Make sure the increment of cur won't overflow by limiting size. */
 	if (size >= U64_MAX - sizeof(disk_dentry))
 		return -ERANGE;
 
-	for (; ctx->pos < size; ctx->pos += sizeof(disk_dentry)) {
+	for (cur = ctx->pos; cur < size; cur += sizeof(disk_dentry)) {
 		u64 disk_len;
 		u8 type;
 
-		ret = tarfs_dev_read(inode->i_sb, offset + ctx->pos, &disk_dentry, sizeof(disk_dentry));
+		ret = tarfs_dev_read(inode->i_sb, offset + cur, &disk_dentry, sizeof(disk_dentry));
 		if (ret)
 			break;
 
 		disk_len = le64_to_cpu(disk_dentry.namelen);
 		if (disk_len > name_len) {
 			kfree(name_buffer);
-			name_buffer = NULL;
 
-			if (disk_len > SIZE_MAX) {
-				ret = -ENOMEM;
-				break;
-			}
+			if (disk_len > SIZE_MAX)
+				return -ENOMEM;
 
-			name_buffer = kmalloc(disk_len, GFP_NOFS);
-			if (!name_buffer) {
-				ret = -ENOMEM;
-				break;
-			}
+			name_buffer = kmalloc(disk_len, GFP_KERNEL);
+			if (!name_buffer)
+				return -ENOMEM;
 			name_len = disk_len;
 		}
 
@@ -167,7 +162,11 @@ static int tarfs_readdir(struct file *file, struct dir_context *ctx)
 	}
 
 	kfree(name_buffer);
-	return ctx->pos != orig_pos ? 0 : ret;
+
+	if (!ret)
+		ctx->pos = cur;
+
+	return ret;
 }
 
 static int tarfs_readpage(struct file *file, struct page *page)
@@ -179,11 +178,8 @@ static int tarfs_readpage(struct file *file, struct page *page)
 	int ret;
 
 	buf = kmap_local_page(page);
-	if (!buf) {
-		SetPageError(page);
-		unlock_page(page);
+	if (!buf)
 		return -ENOMEM;
-	}
 
 	offset = page_offset(page);
 	size = i_size_read(inode);
@@ -335,24 +331,19 @@ static struct inode *tarfs_iget(struct super_block *sb, u64 ino)
 	return inode;
 
 discard:
-	iget_failed(inode);
+	discard_new_inode(inode);
 	return ERR_PTR(ret);
 }
 
-static int tarfs_strcmp(struct super_block *sb, u64 pos, const char *str,
-			size_t size)
+static int tarfs_strcmp(struct super_block *sb, unsigned long pos,
+			    const char *str, size_t size)
 {
 	struct buffer_head *bh;
 	unsigned long offset;
 	size_t segment;
 	bool matched;
-	const struct tarfs_state *state = sb->s_fs_info;
 
-	/* If the string doesn't fit in the data size, it doesn't match. */
-	if (pos + size < pos || pos + size > state->data_size)
-		return 0;
-
-	/* Compare string up to a block at a time. */
+	/* compare string up to a block at a time. */
 	while (size) {
 		offset = pos & (TARFS_BSIZE - 1);
 		segment = min_t(size_t, size, TARFS_BSIZE - offset);
@@ -457,7 +448,7 @@ static struct inode *tarfs_alloc_inode(struct super_block *sb)
 {
 	struct tarfs_inode_info *info;
 
-        info = alloc_inode_sb(sb, tarfs_inode_cachep, GFP_NOFS);
+        info = alloc_inode_sb(sb, tarfs_inode_cachep, GFP_KERNEL);
         if (!info)
                 return NULL;
 
@@ -523,7 +514,7 @@ static int tarfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_xattr = xattr_handlers;
 
 	scount = bdev_nr_sectors(sb->s_bdev);
-	if (scount < TARFS_BSIZE / SECTOR_SIZE)
+	if (!scount)
 		return -ENXIO;
 
 	state = kmalloc(sizeof(*state), GFP_KERNEL);
